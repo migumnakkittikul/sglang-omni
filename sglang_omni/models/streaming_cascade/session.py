@@ -3,7 +3,6 @@
 
 import asyncio
 import threading
-import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import replace
@@ -241,25 +240,23 @@ class ComponentHooks(SessionHooks):
         self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
     ) -> StagePayload:
         session = self.sessions[context.session_identity]
+
+        def emit(output: TimedChunk) -> None:
+            # note (luojiaxuan): a preempt drops what a cancelled append streams back, but this append only hands the chunk to the component, so what the component sends meanwhile goes out on the session's read.
+            if context.cancelled.is_set():
+                session.emit(output)
+            else:
+                context.emit(output)
+
+        # note (luojiaxuan): the component's own task takes an interrupt as a control, so a preempt leaves the handoff to finish rather than losing the chunk and closing the session.
         future = asyncio.run_coroutine_threadsafe(
-            session.append(chunk, context.emit), self.loop
+            session.append(chunk, emit), self.loop
         )
-        deadline = time.monotonic() + self.timeout_s
-        while True:
-            try:
-                future.result(0.02)
-                break
-            except FutureTimeout:
-                if future.done():
-                    raise
-                elif context.cancelled.is_set():
-                    future.cancel()
-                    raise RuntimeError("component append cancelled")
-                elif time.monotonic() >= deadline:
-                    future.cancel()
-                    raise TimeoutError(f"component {self.name!r} append timed out")
-                else:
-                    pass
+        try:
+            future.result(self.timeout_s)
+        except FutureTimeout:
+            future.cancel()
+            raise TimeoutError(f"component {self.name!r} append timed out")
         payload.data = {"accepted": True}
         return payload
 
